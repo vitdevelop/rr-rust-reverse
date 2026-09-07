@@ -1,0 +1,5 @@
+*.patch -text
+*.diff  -text
+*.sh    text eol=lf
+*.py    text eol=lf
+*.md    text eol=lf

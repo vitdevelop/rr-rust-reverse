@@ -1,0 +1,659 @@
+diff --git a/lldb/docs/use/lldbdap.md b/lldb/docs/use/lldbdap.md
+index a4c151a2f..2e9294ad4 100644
+--- a/lldb/docs/use/lldbdap.md
++++ b/lldb/docs/use/lldbdap.md
+@@ -77,7 +77,7 @@ for more information.
+ | supportsHitConditionalBreakpoints     | Y                       | The debug adapter supports breakpoints that break execution after a specified number of hits.                                                                                                                                                                                                                         |
+ | supportsEvaluateForHovers             | Y                       | The debug adapter supports a (side effect free) `evaluate` request for data hovers.                                                                                                                                                                                                                                   |
+ | exceptionBreakpointFilters            | Y                       | Available exception filter options for the `setExceptionBreakpoints` request.                                                                                                                                                                                                                                         |
+-| supportsStepBack                      | N                       | The debug adapter supports stepping back via the `stepBack` and `reverseContinue` requests.                                                                                                                                                                                                                           |
++| supportsStepBack                      | Y                       | Advertised so that `reverseContinue` is offered. Reverse execution only works against a record/replay backend such as `rr`; `reverseContinue` returns an error for any other target. `stepBack` (reverse single-step) is not implemented and always returns an error - use `reverseContinue` with a breakpoint instead.  |
+ | supportsSetVariable                   | N                       | The debug adapter supports setting a variable to a value.                                                                                                                                                                                                                                                             |
+ | supportsRestartFrame                  | Y                       | The debug adapter supports restarting a frame.                                                                                                                                                                                                                                                                        |
+ | supportsGotoTargetsRequest            | N                       | The debug adapter supports the `gotoTargets` request.                                                                                                                                                                                                                                                                 |
+diff --git a/lldb/packages/Python/lldbsuite/test/tools/lldb-dap/dap_server.py b/lldb/packages/Python/lldbsuite/test/tools/lldb-dap/dap_server.py
+index 919ab6566..f79b30be7 100644
+--- a/lldb/packages/Python/lldbsuite/test/tools/lldb-dap/dap_server.py
++++ b/lldb/packages/Python/lldbsuite/test/tools/lldb-dap/dap_server.py
+@@ -1223,6 +1223,38 @@ class DebugCommunication(object):
+         command_dict = {"command": "next", "type": "request", "arguments": args_dict}
+         return self._send_recv(command_dict)
+ 
++    def request_reverseContinue(self, threadId=None, singleThread=False):
++        if self.exit_status is not None:
++            raise ValueError("request_reverseContinue called after process exited")
++        args_dict = {}
++        if threadId is None:
++            threadId = self.get_thread_id()
++        if threadId:
++            args_dict["threadId"] = threadId
++        if singleThread:
++            args_dict["singleThread"] = True
++        command_dict = {
++            "command": "reverseContinue",
++            "type": "request",
++            "arguments": args_dict,
++        }
++        response = self._send_recv(command_dict)
++        if response["success"]:
++            self._process_continued(True)
++        # Caller must still call wait_for_stopped.
++        return response
++
++    def request_stepBack(self, threadId, granularity="statement"):
++        if self.exit_status is not None:
++            raise ValueError("request_stepBack called after process exited")
++        args_dict = {"threadId": threadId, "granularity": granularity}
++        command_dict = {
++            "command": "stepBack",
++            "type": "request",
++            "arguments": args_dict,
++        }
++        return self._send_recv(command_dict)
++
+     def request_stepIn(self, threadId, targetId, granularity="statement"):
+         if self.exit_status is not None:
+             raise ValueError("request_stepIn called after process exited")
+diff --git a/lldb/test/API/tools/lldb-dap/reverse-execution/Makefile b/lldb/test/API/tools/lldb-dap/reverse-execution/Makefile
+new file mode 100644
+index 000000000..104959400
+--- /dev/null
++++ b/lldb/test/API/tools/lldb-dap/reverse-execution/Makefile
+@@ -0,0 +1,3 @@
++C_SOURCES := main.c
++
++include Makefile.rules
+diff --git a/lldb/test/API/tools/lldb-dap/reverse-execution/TestDAP_reverseExecution.py b/lldb/test/API/tools/lldb-dap/reverse-execution/TestDAP_reverseExecution.py
+new file mode 100644
+index 000000000..42e1a5c0b
+--- /dev/null
++++ b/lldb/test/API/tools/lldb-dap/reverse-execution/TestDAP_reverseExecution.py
+@@ -0,0 +1,160 @@
++"""
++Test lldb-dap reverse execution: the `reverseContinue` and `stepBack` requests
++and the `supportsStepBack` capability.
++
++The positive `reverseContinue` cases reuse lldbreverse.ReverseTestBase, which
++puts a recording gdbserver proxy in front of lldb-server so reverse execution
++can be exercised without rr installed (see also
++lldb/test/API/functionalities/reverse-execution).
++"""
++
++import os
++
++import lldbdap_testcase
++from lldbsuite.test.decorators import *
++from lldbsuite.test.lldbreverse import ReverseTestBase
++from lldbsuite.test.lldbtest import *
++
++
++def error_message(response):
++    """Human-readable text from a failed DAP response."""
++    if response.get("message"):
++        return response["message"]
++    return response.get("body", {}).get("error", {}).get("format", "")
++
++
++class TestDAP_reverseExecutionErrors(lldbdap_testcase.DAPTestCaseBase):
++    """Cases that do not need a recording backend."""
++
++    def test_supports_step_back_capability(self):
++        """`initialize` advertises `supportsStepBack` unconditionally so that
++        clients offer `reverseContinue`."""
++        self.create_debug_adapter()
++        self.addTearDownHook(lambda: self.dap_server.terminate())
++        resp = self.dap_server.request_initialize()
++        self.assertTrue(resp["success"])
++        self.assertEqual(resp["body"]["supportsStepBack"], True)
++
++    @skipIfWindows
++    def test_reverse_continue_errors_without_reverse_support(self):
++        """Against an ordinary (non-record/replay) process, `reverseContinue`
++        returns a clean DAP error rather than crashing or hanging."""
++        program = self.getBuildArtifact("a.out")
++        self.build_and_launch(program)
++        bp_ids = self.set_function_breakpoints(["trigger_breakpoint"])
++        self.continue_to_breakpoints(bp_ids)
++
++        tid = self.dap_server.get_thread_id()
++        resp = self.dap_server.request_reverseContinue(threadId=tid)
++        self.assertFalse(resp["success"])
++        self.assertIn("reverse", error_message(resp).lower())
++
++        # The process is still alive and responsive.
++        self.dap_server.request_setFunctionBreakpoints([])
++        self.continue_to_exit()
++
++    @skipIfWindows
++    def test_step_back_is_not_supported(self):
++        """`stepBack` always returns a clean 'not supported' DAP error."""
++        program = self.getBuildArtifact("a.out")
++        self.build_and_launch(program)
++        bp_ids = self.set_function_breakpoints(["trigger_breakpoint"])
++        self.continue_to_breakpoints(bp_ids)
++
++        tid = self.dap_server.get_thread_id()
++        resp = self.dap_server.request_stepBack(threadId=tid)
++        self.assertFalse(resp["success"])
++        self.assertIn("not supported", error_message(resp).lower())
++
++        self.dap_server.request_setFunctionBreakpoints([])
++        self.continue_to_exit()
++
++
++class TestDAP_reverseContinue(lldbdap_testcase.DAPTestCaseBase, ReverseTestBase):
++    """`reverseContinue` cases driven through the recording gdbserver proxy."""
++
++    def tearDown(self):
++        # The lldb-dap adapter holds the client end of the proxy connection.
++        # GDBProxyTestBase.tearDown() joins the proxy server thread, which only
++        # returns once that connection is closed - so kill the adapter first.
++        try:
++            if getattr(self, "dap_server", None) is not None:
++                self.dap_server.terminate()
++        finally:
++            super().tearDown()
++
++    def setup_dap_recording(self):
++        """Attach lldb-dap through the recording proxy, run forward to
++        `stop_recording`, and return the stopped thread id. Reverse execution is
++        then possible back to the start of `start_recording`.
++
++        On return no breakpoints are set, so a plain `reverseContinue` runs to
++        the history boundary.
++        """
++        self.build()
++        program = self.getBuildArtifact("a.out")
++
++        # Bring up lldb-server behind the recording proxy, then point lldb-dap at
++        # the proxy's TCP port.
++        self.prep_debug_monitor_and_inferior()
++        self.server.start()
++        host, port = self.server._socket._server_socket.getsockname()[:2]
++        if ":" in host:  # IPv6 literal
++            host = "[{}]".format(host)
++        self.create_debug_adapter()
++        self.assertTrue(self.dap_server.request_initialize()["success"])
++        self.dap_server.request_attach(
++            program=program, gdbRemotePort=port, gdbRemoteHostname=host
++        )
++        self.dap_server.wait_for_event(["initialized"])
++
++        marker_bps = self.set_function_breakpoints(["start_recording", "stop_recording"])
++        self.dap_server.request_configurationDone()
++
++        # Run to start_recording, turn recording on, run to stop_recording.
++        self.dap_server.wait_for_stopped()
++        frame = self.dap_server.get_stackFrame()
++        self.assertIn("start_recording", frame["name"])
++        self.start_recording()
++        self.dap_server.request_continue()
++        self.dap_server.wait_for_stopped()
++        frame = self.dap_server.get_stackFrame()
++        self.assertIn("stop_recording", frame["name"])
++        self.stop_recording()
++
++        # Drop the marker breakpoints so they don't interfere with reverse
++        # execution (the recorder stops reverse-continue at any set breakpoint).
++        self.dap_server.request_setFunctionBreakpoints([])
++        return self.dap_server.get_thread_id()
++
++    @skipIfWindows
++    @skipIfRemote
++    def test_reverse_continue_to_breakpoint(self):
++        tid = self.setup_dap_recording()
++
++        # A breakpoint on code that already executed (during recording).
++        self.set_function_breakpoints(["trigger_breakpoint"])
++
++        resp = self.dap_server.request_reverseContinue(threadId=tid)
++        self.assertTrue(resp["success"], resp)
++        self.dap_server.wait_for_stopped()
++
++        frame = self.dap_server.get_stackFrame(threadId=tid)
++        self.assertIn(
++            "trigger_breakpoint",
++            frame["name"],
++            "reverseContinue rewound to the earlier breakpoint",
++        )
++
++    @skipIfWindows
++    @skipIfRemote
++    def test_reverse_continue_to_history_boundary(self):
++        tid = self.setup_dap_recording()
++
++        # No earlier breakpoint: reverse-continue runs to the start of the
++        # recording and stops there, reported as reason "history boundary".
++        resp = self.dap_server.request_reverseContinue(threadId=tid)
++        self.assertTrue(resp["success"], resp)
++        stopped = self.dap_server.wait_for_stopped()
++        reasons = [e["body"].get("reason") for e in stopped if e["event"] == "stopped"]
++        self.assertIn("history boundary", reasons)
+diff --git a/lldb/test/API/tools/lldb-dap/reverse-execution/TestDAP_reverseExecutionRR.py b/lldb/test/API/tools/lldb-dap/reverse-execution/TestDAP_reverseExecutionRR.py
+new file mode 100644
+index 000000000..96b4d431b
+--- /dev/null
++++ b/lldb/test/API/tools/lldb-dap/reverse-execution/TestDAP_reverseExecutionRR.py
+@@ -0,0 +1,106 @@
++"""
++Phase 3.2: rr-backed end-to-end test for lldb-dap `reverseContinue`.
++
++Unlike TestDAP_reverseExecution.py (which fakes record/replay with a gdbserver
++proxy), this drives the real thing: `rr record` a program, replay it as an
++lldb-compatible gdbserver (`rr replay -s <port> -d lldb`), attach lldb-dap over
++that port, and check that `reverseContinue` rewinds execution and that running
++back past the start of the recording reports a "history boundary" stop.
++
++Skipped unless `rr` is on PATH, so it does not run in ordinary CI.
++"""
++
++import os
++import shutil
++import socket
++import subprocess
++import time
++import unittest
++
++import lldbdap_testcase
++from lldbsuite.test.decorators import *
++from lldbsuite.test.lldbtest import *
++
++
++@unittest.skipUnless(shutil.which("rr"), "rr is not installed")
++@skipIfWindows
++class TestDAP_reverseExecutionRR(lldbdap_testcase.DAPTestCaseBase):
++    def tearDown(self):
++        # Kill the adapter first (it holds the client end of the rr replay
++        # connection), then the rr replay server.
++        try:
++            if getattr(self, "dap_server", None) is not None:
++                self.dap_server.terminate()
++        finally:
++            if getattr(self, "_rr_replay", None) is not None:
++                self._rr_replay.kill()
++                self._rr_replay.wait()
++            super().tearDown()
++
++    def _wait_port(self, port, timeout=20):
++        deadline = time.time() + timeout
++        while time.time() < deadline:
++            try:
++                socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
++                return
++            except OSError:
++                time.sleep(0.1)
++        self.fail("rr replay gdbserver never started listening on %d" % port)
++
++    def test_reverse_continue_rr(self):
++        self.build()
++        program = self.getBuildArtifact("a.out")
++        rr_dir = self.getBuildArtifact("rr-trace")
++        env = dict(os.environ)
++        env["_RR_TRACE_DIR"] = rr_dir
++
++        rec = subprocess.run(
++            ["rr", "record", "-n", program],
++            capture_output=True,
++            text=True,
++            env=env,
++        )
++        if rec.returncode != 0:
++            self.skipTest("rr record failed (perf_event_paranoid?):\n" + rec.stderr)
++
++        port = 50999
++        self._rr_replay = subprocess.Popen(
++            ["rr", "replay", "-s", str(port), "-k", "-d", "lldb"],
++            cwd=rr_dir,
++            stdout=subprocess.DEVNULL,
++            stderr=subprocess.DEVNULL,
++            env=env,
++        )
++        self._wait_port(port)
++
++        self.create_debug_adapter()
++        self.assertTrue(self.dap_server.request_initialize()["success"])
++        self.dap_server.request_attach(
++            program=program, gdbRemotePort=port, gdbRemoteHostname="127.0.0.1"
++        )
++        self.dap_server.wait_for_event(["initialized"])
++        bp_ids = self.set_function_breakpoints(["trigger_breakpoint"])
++        self.dap_server.request_configurationDone()
++        self.dap_server.wait_for_stopped()
++        tid = self.dap_server.get_thread_id()
++
++        # Forward to the 3rd hit of trigger_breakpoint().
++        for _ in range(2):
++            self.dap_server.request_continue()
++            self.dap_server.wait_for_stopped()
++        fwd_round = self.get_local_as_int("round", threadId=tid)
++
++        # reverseContinue lands on the SAME breakpoint one iteration earlier.
++        resp = self.dap_server.request_reverseContinue(threadId=tid)
++        self.assertTrue(resp["success"], resp)
++        self.dap_server.wait_for_stopped()
++        rev_round = self.get_local_as_int("round", threadId=tid)
++        self.assertLess(rev_round, fwd_round, "reverseContinue rewound the loop")
++
++        # With no breakpoint, reverse-continue runs to the history boundary.
++        self.dap_server.request_setFunctionBreakpoints([])
++        resp = self.dap_server.request_reverseContinue(threadId=tid)
++        self.assertTrue(resp["success"], resp)
++        stopped = self.dap_server.wait_for_stopped()
++        reasons = [e["body"].get("reason") for e in stopped if e["event"] == "stopped"]
++        self.assertIn("history boundary", reasons)
+diff --git a/lldb/test/API/tools/lldb-dap/reverse-execution/main.c b/lldb/test/API/tools/lldb-dap/reverse-execution/main.c
+new file mode 100644
+index 000000000..1966379bc
+--- /dev/null
++++ b/lldb/test/API/tools/lldb-dap/reverse-execution/main.c
+@@ -0,0 +1,20 @@
++// Marker functions. Recording (see lldbreverse.ReverseTestBase) is enabled while
++// execution is between the start of start_recording() and the start of
++// stop_recording(); reverse execution can then rewind through everything in
++// between, including the calls to trigger_breakpoint().
++
++int g_value = 0;
++
++static void start_recording() {}
++
++static void trigger_breakpoint(int round) { g_value += round; }
++
++static void stop_recording() {}
++
++int main() {
++  start_recording();
++  for (int round = 0; round < 4; ++round)
++    trigger_breakpoint(round);
++  stop_recording();
++  return 0;
++}
+diff --git a/lldb/tools/lldb-dap/CMakeLists.txt b/lldb/tools/lldb-dap/CMakeLists.txt
+index 1694af1cb..5534adb4d 100644
+--- a/lldb/tools/lldb-dap/CMakeLists.txt
++++ b/lldb/tools/lldb-dap/CMakeLists.txt
+@@ -50,6 +50,7 @@ add_lldb_library(lldbDAP
+   Handler/ReadMemoryRequestHandler.cpp
+   Handler/RequestHandler.cpp
+   Handler/RestartRequestHandler.cpp
++  Handler/ReverseContinueRequestHandler.cpp
+   Handler/ScopesRequestHandler.cpp
+   Handler/SetBreakpointsRequestHandler.cpp
+   Handler/SetDataBreakpointsRequestHandler.cpp
+@@ -59,6 +60,7 @@ add_lldb_library(lldbDAP
+   Handler/SetVariableRequestHandler.cpp
+   Handler/SourceRequestHandler.cpp
+   Handler/StackTraceRequestHandler.cpp
++  Handler/StepBackRequestHandler.cpp
+   Handler/StepInRequestHandler.cpp
+   Handler/StepInTargetsRequestHandler.cpp
+   Handler/StepOutRequestHandler.cpp
+diff --git a/lldb/tools/lldb-dap/DAP.cpp b/lldb/tools/lldb-dap/DAP.cpp
+index 03caeb506..a6aae951f 100644
+--- a/lldb/tools/lldb-dap/DAP.cpp
++++ b/lldb/tools/lldb-dap/DAP.cpp
+@@ -1550,6 +1550,7 @@ void DAP::RegisterRequests() {
+   RegisterRequest<PauseRequestHandler>();
+   RegisterRequest<ReadMemoryRequestHandler>();
+   RegisterRequest<RestartRequestHandler>();
++  RegisterRequest<ReverseContinueRequestHandler>();
+   RegisterRequest<ScopesRequestHandler>();
+   RegisterRequest<SetBreakpointsRequestHandler>();
+   RegisterRequest<SetDataBreakpointsRequestHandler>();
+@@ -1559,6 +1560,7 @@ void DAP::RegisterRequests() {
+   RegisterRequest<SetVariableRequestHandler>();
+   RegisterRequest<SourceRequestHandler>();
+   RegisterRequest<StackTraceRequestHandler>();
++  RegisterRequest<StepBackRequestHandler>();
+   RegisterRequest<StepInRequestHandler>();
+   RegisterRequest<StepInTargetsRequestHandler>();
+   RegisterRequest<StepOutRequestHandler>();
+diff --git a/lldb/tools/lldb-dap/Handler/ContinueRequestHandler.cpp b/lldb/tools/lldb-dap/Handler/ContinueRequestHandler.cpp
+index 361c86421..229832c5f 100644
+--- a/lldb/tools/lldb-dap/Handler/ContinueRequestHandler.cpp
++++ b/lldb/tools/lldb-dap/Handler/ContinueRequestHandler.cpp
+@@ -37,7 +37,12 @@ ContinueRequestHandler::Run(const ContinueArguments &args) const {
+   if (args.singleThread)
+     dap.GetLLDBThread(args.threadId).Resume(error);
+   else
+-    error = process.Continue();
++    // Route through ContinueInDirection(eRunForward) rather than Continue() so
++    // that a forward `continue` issued after a `reverseContinue` resets the
++    // process base direction to forward instead of silently resuming backwards.
++    // For a target that was never running in reverse this is equivalent to
++    // Continue().
++    error = process.ContinueInDirection(lldb::eRunForward);
+ 
+   if (error.Fail())
+     return ToError(error);
+diff --git a/lldb/tools/lldb-dap/Handler/RequestHandler.h b/lldb/tools/lldb-dap/Handler/RequestHandler.h
+index 8098dc5c7..5246d9598 100644
+--- a/lldb/tools/lldb-dap/Handler/RequestHandler.h
++++ b/lldb/tools/lldb-dap/Handler/RequestHandler.h
+@@ -261,6 +261,39 @@ public:
+   Run(const protocol::ContinueArguments &args) const override;
+ };
+ 
++/// Resumes backward execution of the process. Only meaningful against a
++/// record/replay backend such as `rr`; against any other target the underlying
++/// `SBProcess::ContinueInDirection` call fails and a DAP error is returned.
++///
++/// Advertising the `supportsStepBack` capability (see `GetSupportedFeatures`)
++/// also makes clients send `stepBack`; that request is answered with an
++/// explicit "not supported" error, see `StepBackRequestHandler`.
++class ReverseContinueRequestHandler
++    : public RequestHandler<protocol::ReverseContinueArguments,
++                            protocol::ReverseContinueResponse> {
++public:
++  using RequestHandler::RequestHandler;
++  static llvm::StringLiteral GetCommand() { return "reverseContinue"; }
++  FeatureSet GetSupportedFeatures() const override {
++    return {protocol::eAdapterFeatureStepBack};
++  }
++  llvm::Error Run(const protocol::ReverseContinueArguments &args) const override;
++};
++
++/// The `stepBack` request (single-step backwards) has no implementation in LLDB:
++/// there is no reverse step-over/step-into thread plan or SB API, only reverse
++/// *continue*. This handler therefore always returns a DAP error directing the
++/// client to use `reverseContinue`. It is still registered so that the error is
++/// a clear, typed message rather than a generic "unknown request".
++class StepBackRequestHandler
++    : public RequestHandler<protocol::StepBackArguments,
++                            protocol::StepBackResponse> {
++public:
++  using RequestHandler::RequestHandler;
++  static llvm::StringLiteral GetCommand() { return "stepBack"; }
++  llvm::Error Run(const protocol::StepBackArguments &args) const override;
++};
++
+ class ConfigurationDoneRequestHandler
+     : public RequestHandler<protocol::ConfigurationDoneArguments,
+                             protocol::ConfigurationDoneResponse> {
+diff --git a/lldb/tools/lldb-dap/Handler/ReverseContinueRequestHandler.cpp b/lldb/tools/lldb-dap/Handler/ReverseContinueRequestHandler.cpp
+new file mode 100644
+index 000000000..c51e062bc
+--- /dev/null
++++ b/lldb/tools/lldb-dap/Handler/ReverseContinueRequestHandler.cpp
+@@ -0,0 +1,54 @@
++//===-- ReverseContinueRequestHandler.cpp ---------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "DAP.h"
++#include "DAPError.h"
++#include "Handler/RequestHandler.h"
++#include "LLDBUtils.h"
++#include "Protocol/ProtocolRequests.h"
++#include "lldb/API/SBError.h"
++#include "lldb/API/SBProcess.h"
++#include "lldb/lldb-enumerations.h"
++#include "llvm/Support/Error.h"
++
++using namespace llvm;
++using namespace lldb;
++using namespace lldb_dap::protocol;
++
++namespace lldb_dap {
++
++/// The request resumes backward execution of all threads, until a breakpoint is
++/// hit or the beginning of the recorded history is reached ("history boundary",
++/// reported as an ordinary `stopped` event with reason `history boundary`).
++///
++/// Reverse execution requires a record/replay backend such as `rr`;
++/// `SBProcess::ContinueInDirection` fails cleanly for a process that does not
++/// support it (for example a plain `lldb-server` or non-rr `gdb-remote`
++/// target), which is surfaced here as a DAP error response.
++Error ReverseContinueRequestHandler::Run(
++    const ReverseContinueArguments &args) const {
++  SBProcess process = dap.target.GetProcess();
++
++  if (!SBDebugger::StateIsStoppedState(process.GetState()))
++    return make_error<NotStoppedError>();
++
++  // Record/replay backends rewind the entire process; a single thread cannot be
++  // run backwards while the others stay put. Rather than silently reversing
++  // every thread, reject the single-thread request.
++  if (args.singleThread)
++    return make_error<DAPError>(
++        "single-thread reverse execution is not supported");
++
++  SBError error = process.ContinueInDirection(lldb::eRunReverse);
++  if (error.Fail())
++    return ToError(error);
++
++  return Error::success();
++}
++
++} // namespace lldb_dap
+diff --git a/lldb/tools/lldb-dap/Handler/StepBackRequestHandler.cpp b/lldb/tools/lldb-dap/Handler/StepBackRequestHandler.cpp
+new file mode 100644
+index 000000000..98e725cc0
+--- /dev/null
++++ b/lldb/tools/lldb-dap/Handler/StepBackRequestHandler.cpp
+@@ -0,0 +1,35 @@
++//===-- StepBackRequestHandler.cpp ----------------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "DAP.h"
++#include "DAPError.h"
++#include "Handler/RequestHandler.h"
++#include "Protocol/ProtocolRequests.h"
++#include "llvm/Support/Error.h"
++
++using namespace llvm;
++using namespace lldb_dap::protocol;
++
++namespace lldb_dap {
++
++/// The `stepBack` request would single-step the given thread one source
++/// line/instruction backwards. LLDB has no reverse step-over/step-into thread
++/// plan or SB API - only reverse *continue* (`SBProcess::ContinueInDirection`).
++///
++/// A reverse single-step built on top of reverse-continue plus temporary
++/// breakpoints is a non-trivial design problem (recursion, inlining, frame
++/// identity) and is intentionally out of scope here. Until LLDB grows a real
++/// reverse-step capability this request is answered with an explicit error so
++/// the client can fall back to `reverseContinue`.
++Error StepBackRequestHandler::Run(const StepBackArguments &) const {
++  return make_error<DAPError>(
++      "reverse stepping (stepBack) is not supported; use reverseContinue "
++      "with a breakpoint instead");
++}
++
++} // namespace lldb_dap
+diff --git a/lldb/tools/lldb-dap/Protocol/ProtocolRequests.cpp b/lldb/tools/lldb-dap/Protocol/ProtocolRequests.cpp
+index 68149a21c..5efdf60dc 100644
+--- a/lldb/tools/lldb-dap/Protocol/ProtocolRequests.cpp
++++ b/lldb/tools/lldb-dap/Protocol/ProtocolRequests.cpp
+@@ -375,6 +375,13 @@ json::Value toJSON(const ContinueResponseBody &CRB) {
+   return std::move(Body);
+ }
+ 
++bool fromJSON(const json::Value &Params, ReverseContinueArguments &RCA,
++              json::Path P) {
++  json::ObjectMapper O(Params, P);
++  return O && O.map("threadId", RCA.threadId) &&
++         O.mapOptional("singleThread", RCA.singleThread);
++}
++
+ bool fromJSON(const json::Value &Params, CompletionsArguments &CA,
+               json::Path P) {
+   json::ObjectMapper O(Params, P);
+@@ -445,6 +452,13 @@ bool fromJSON(const json::Value &Params, NextArguments &NA, json::Path P) {
+          OM.mapOptional("granularity", NA.granularity);
+ }
+ 
++bool fromJSON(const json::Value &Params, StepBackArguments &SBA, json::Path P) {
++  json::ObjectMapper OM(Params, P);
++  return OM && OM.map("threadId", SBA.threadId) &&
++         OM.mapOptional("singleThread", SBA.singleThread) &&
++         OM.mapOptional("granularity", SBA.granularity);
++}
++
+ bool fromJSON(const json::Value &Params, StepInArguments &SIA, json::Path P) {
+   json::ObjectMapper OM(Params, P);
+   return OM && OM.map("threadId", SIA.threadId) &&
+diff --git a/lldb/tools/lldb-dap/Protocol/ProtocolRequests.h b/lldb/tools/lldb-dap/Protocol/ProtocolRequests.h
+index 0a8425c1a..0e6201199 100644
+--- a/lldb/tools/lldb-dap/Protocol/ProtocolRequests.h
++++ b/lldb/tools/lldb-dap/Protocol/ProtocolRequests.h
+@@ -394,6 +394,24 @@ struct ContinueResponseBody {
+ };
+ llvm::json::Value toJSON(const ContinueResponseBody &);
+ 
++/// Arguments for `reverseContinue` request.
++struct ReverseContinueArguments {
++  /// Specifies the active thread. If the debug adapter supports single thread
++  /// execution (see `supportsSingleThreadExecutionRequests`) and the `singleThread`
++  /// argument is true, only the thread with this ID is resumed.
++  lldb::tid_t threadId = LLDB_INVALID_THREAD_ID;
++
++  /// If this flag is true, backward execution is resumed only for the thread
++  /// with given `threadId`.
++  bool singleThread = false;
++};
++bool fromJSON(const llvm::json::Value &, ReverseContinueArguments &,
++              llvm::json::Path);
++
++/// Response to `reverseContinue` request. This is just an acknowledgement, so
++/// no body field is required.
++using ReverseContinueResponse = VoidResponse;
++
+ /// Arguments for `completions` request.
+ struct CompletionsArguments {
+   /// Returns completions in the scope of this stack frame. If not specified,
+@@ -563,6 +581,25 @@ bool fromJSON(const llvm::json::Value &, NextArguments &, llvm::json::Path);
+ /// body field is required.
+ using NextResponse = VoidResponse;
+ 
++/// Arguments for `stepBack` request.
++struct StepBackArguments {
++  /// Specifies the thread for which to resume execution for one step backwards
++  /// (of the given granularity).
++  lldb::tid_t threadId = LLDB_INVALID_THREAD_ID;
++
++  /// If this flag is true, all other suspended threads are not resumed.
++  bool singleThread = false;
++
++  /// Stepping granularity to step. If no granularity is specified, a
++  /// granularity of `statement` is assumed.
++  SteppingGranularity granularity = eSteppingGranularityStatement;
++};
++bool fromJSON(const llvm::json::Value &, StepBackArguments &, llvm::json::Path);
++
++/// Response to `stepBack` request. This is just an acknowledgement, so no
++/// body field is required.
++using StepBackResponse = VoidResponse;
++
+ /// Arguments for `stepIn` request.
+ struct StepInArguments {
+   /// Specifies the thread for which to resume execution for one step-into (of

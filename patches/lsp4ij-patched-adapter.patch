@@ -1,0 +1,515 @@
+diff --git a/src/main/java/com/redhat/devtools/lsp4ij/dap/DAPDebugProcess.java b/src/main/java/com/redhat/devtools/lsp4ij/dap/DAPDebugProcess.java
+index fda5372..0c6bd4f 100644
+--- a/src/main/java/com/redhat/devtools/lsp4ij/dap/DAPDebugProcess.java
++++ b/src/main/java/com/redhat/devtools/lsp4ij/dap/DAPDebugProcess.java
+@@ -18,6 +18,7 @@ import com.intellij.execution.ui.RunnerLayoutUi;
+ import com.intellij.execution.ui.layout.PlaceInGrid;
+ import com.intellij.icons.AllIcons;
+ import com.intellij.openapi.Disposable;
++import com.intellij.openapi.actionSystem.DefaultActionGroup;
+ import com.intellij.openapi.application.ApplicationManager;
+ import com.intellij.openapi.progress.ProcessCanceledException;
+ import com.intellij.openapi.progress.ProgressIndicator;
+@@ -37,6 +38,8 @@ import com.intellij.xdebugger.frame.XStackFrame;
+ import com.intellij.xdebugger.frame.XSuspendContext;
+ import com.intellij.xdebugger.stepping.XSmartStepIntoHandler;
+ import com.intellij.xdebugger.ui.XDebugTabLayouter;
++import com.redhat.devtools.lsp4ij.dap.actions.ReverseContinueAction;
++import com.redhat.devtools.lsp4ij.dap.actions.StepBackAction;
+ import com.redhat.devtools.lsp4ij.dap.breakpoints.DAPBreakpointHandlerBase;
+ import com.redhat.devtools.lsp4ij.dap.breakpoints.DAPExceptionBreakpointsPanel;
+ import com.redhat.devtools.lsp4ij.dap.client.DAPClient;
+@@ -337,6 +340,70 @@ public class DAPDebugProcess extends XDebugProcess implements Disposable {
+                 .getAlternativeSourceKindState().getValue() ? SteppingGranularity.INSTRUCTION : null;
+     }
+ 
++    /**
++     * Returns the DAP client connected to the debug adapter, or {@code null} while the session
++     * is still connecting or has already terminated.
++     */
++    public @Nullable DAPClient getConnectedClient() {
++        return parentClient;
++    }
++
++    /**
++     * Resumes backward execution of the current thread (DAP 'reverseContinue').
++     * <p>
++     * There is no {@code XDebugProcess} hook for reverse execution, so unlike {@link #resume}
++     * this must notify the session that the process resumed and surface adapter errors itself.
++     * The subsequent 'stopped' event flows through the same
++     * {@code XDebugSession.positionReached()} path as a forward stop, so the frames and
++     * variables panes refresh identically going backwards.
++     */
++    public void reverseResume(@Nullable XSuspendContext context) {
++        runReverse(context, (client, threadId) -> client.reverseContinue(threadId));
++    }
++
++    /**
++     * Single steps the current thread backwards (DAP 'stepBack').
++     */
++    public void startStepBack(@Nullable XSuspendContext context) {
++        runReverse(context, (client, threadId) ->
++                client.stepBack(threadId, getSteppingGranularity(client)));
++    }
++
++    private void runReverse(@Nullable XSuspendContext context,
++                            @NotNull java.util.function.BiFunction<DAPClient, Integer, CompletableFuture<Void>> op) {
++        if (!(context instanceof DAPSuspendContext dapContext)) {
++            return;
++        }
++        Integer threadId = dapContext.getThreadId();
++        if (threadId == null) {
++            return;
++        }
++        DAPClient client = dapContext.getClient();
++        XDebugSession session = getSession();
++        op.apply(client, threadId)
++                .whenComplete((unused, error) -> {
++                    if (error != null) {
++                        print("Reverse execution failed: " + error.getMessage(),
++                                ConsoleViewContentType.LOG_ERROR_OUTPUT);
++                    } else {
++                        // Tell the platform the process is running again; the adapter's
++                        // 'stopped' event will call positionReached() and refresh the UI.
++                        session.sessionResumed();
++                    }
++                });
++    }
++
++    @Override
++    public void registerAdditionalActions(@NotNull DefaultActionGroup leftToolbar,
++                                          @NotNull DefaultActionGroup topToolbar,
++                                          @NotNull DefaultActionGroup settings) {
++        // These stay hidden for ordinary DAP sessions: each action's update() checks the
++        // adapter's 'supportsStepBack' capability before making itself visible.
++        topToolbar.addSeparator();
++        topToolbar.add(new ReverseContinueAction());
++        topToolbar.add(new StepBackAction());
++    }
++
+     @Override
+     public void resume(@Nullable XSuspendContext context) {
+         resume(context, null);
+diff --git a/src/main/java/com/redhat/devtools/lsp4ij/dap/actions/DAPDebuggerIcons.java b/src/main/java/com/redhat/devtools/lsp4ij/dap/actions/DAPDebuggerIcons.java
+new file mode 100644
+index 0000000..bb149d2
+--- /dev/null
++++ b/src/main/java/com/redhat/devtools/lsp4ij/dap/actions/DAPDebuggerIcons.java
+@@ -0,0 +1,30 @@
++/*******************************************************************************
++ * Copyright (c) 2026 Red Hat, Inc.
++ * Distributed under license by Red Hat, Inc. All rights reserved.
++ * This program is made available under the terms of the
++ * Eclipse Public License v2.0 which accompanies this distribution,
++ * and is available at http://www.eclipse.org/legal/epl-v20.html
++ *
++ * Contributors:
++ * Red Hat, Inc. - initial API and implementation
++ ******************************************************************************/
++package com.redhat.devtools.lsp4ij.dap.actions;
++
++import com.intellij.openapi.util.IconLoader;
++
++import javax.swing.*;
++
++/**
++ * Icons for the reverse-execution debugger actions.
++ */
++public final class DAPDebuggerIcons {
++
++    private DAPDebuggerIcons() {
++    }
++
++    public static final Icon ReverseContinue =
++            IconLoader.getIcon("/icons/dap/reverseContinue.svg", DAPDebuggerIcons.class);
++
++    public static final Icon StepBack =
++            IconLoader.getIcon("/icons/dap/stepBack.svg", DAPDebuggerIcons.class);
++}
+diff --git a/src/main/java/com/redhat/devtools/lsp4ij/dap/actions/DAPReverseActionBase.java b/src/main/java/com/redhat/devtools/lsp4ij/dap/actions/DAPReverseActionBase.java
+new file mode 100644
+index 0000000..b17b1af
+--- /dev/null
++++ b/src/main/java/com/redhat/devtools/lsp4ij/dap/actions/DAPReverseActionBase.java
+@@ -0,0 +1,101 @@
++/*******************************************************************************
++ * Copyright (c) 2026 Red Hat, Inc.
++ * Distributed under license by Red Hat, Inc. All rights reserved.
++ * This program is made available under the terms of the
++ * Eclipse Public License v2.0 which accompanies this distribution,
++ * and is available at http://www.eclipse.org/legal/epl-v20.html
++ *
++ * Contributors:
++ * Red Hat, Inc. - initial API and implementation
++ ******************************************************************************/
++package com.redhat.devtools.lsp4ij.dap.actions;
++
++import com.intellij.openapi.actionSystem.ActionUpdateThread;
++import com.intellij.openapi.actionSystem.AnAction;
++import com.intellij.openapi.actionSystem.AnActionEvent;
++import com.intellij.openapi.actionSystem.Presentation;
++import com.intellij.openapi.project.Project;
++import com.intellij.xdebugger.XDebugSession;
++import com.intellij.xdebugger.XDebuggerManager;
++import com.intellij.xdebugger.frame.XSuspendContext;
++import com.redhat.devtools.lsp4ij.dap.DAPDebugProcess;
++import com.redhat.devtools.lsp4ij.dap.client.DAPClient;
++import org.jetbrains.annotations.NotNull;
++import org.jetbrains.annotations.Nls;
++import org.jetbrains.annotations.Nullable;
++
++import javax.swing.*;
++import java.util.function.Supplier;
++
++/**
++ * Base class for the reverse-execution debugger toolbar actions.
++ * <p>
++ * Both actions are added to every DAP session's debugger toolbar by
++ * {@link DAPDebugProcess#registerAdditionalActions}, but they stay hidden unless the
++ * connected adapter advertised the DAP {@code supportsStepBack} capability, so ordinary
++ * DAP sessions are visually unchanged. They are enabled only while the session is
++ * suspended, matching the forward step actions.
++ */
++public abstract class DAPReverseActionBase extends AnAction {
++
++    protected DAPReverseActionBase(@NotNull Supplier<@Nls String> text,
++                                   @NotNull Supplier<@Nls String> description,
++                                   @Nullable Icon icon) {
++        super(text, description, icon);
++    }
++
++    @Override
++    public void update(@NotNull AnActionEvent e) {
++        Presentation presentation = e.getPresentation();
++        XDebugSession session = getDebugSession(e);
++        DAPClient client = getConnectedClient(session);
++        boolean available = client != null && client.isSupportsStepBack();
++        presentation.setVisible(available);
++        presentation.setEnabled(available && session != null && session.isSuspended());
++    }
++
++    @Override
++    public void actionPerformed(@NotNull AnActionEvent e) {
++        XDebugSession session = getDebugSession(e);
++        if (session == null || !session.isSuspended()) {
++            return;
++        }
++        if (session.getDebugProcess() instanceof DAPDebugProcess process) {
++            perform(process, session.getSuspendContext());
++        }
++    }
++
++    /**
++     * Runs the reverse operation against the DAP process for the current suspend context.
++     */
++    protected abstract void perform(@NotNull DAPDebugProcess process, @Nullable XSuspendContext context);
++
++    @Override
++    public @NotNull ActionUpdateThread getActionUpdateThread() {
++        return ActionUpdateThread.EDT;
++    }
++
++    private static @Nullable DAPClient getConnectedClient(@Nullable XDebugSession session) {
++        if (session != null && session.getDebugProcess() instanceof DAPDebugProcess process) {
++            return process.getConnectedClient();
++        }
++        return null;
++    }
++
++    /**
++     * Resolves the current debug session from the action context, falling back to
++     * {@link XDebuggerManager#getCurrentSession()} when the context does not carry it
++     * (e.g. the split debugger UI).
++     */
++    protected static @Nullable XDebugSession getDebugSession(@NotNull AnActionEvent e) {
++        XDebugSession session = e.getDataContext().getData(XDebugSession.DATA_KEY);
++        if (session != null) {
++            return session;
++        }
++        Project project = e.getProject();
++        if (project == null) {
++            return null;
++        }
++        return XDebuggerManager.getInstance(project).getCurrentSession();
++    }
++}
+diff --git a/src/main/java/com/redhat/devtools/lsp4ij/dap/actions/DAPReverseExecutionSupport.java b/src/main/java/com/redhat/devtools/lsp4ij/dap/actions/DAPReverseExecutionSupport.java
+new file mode 100644
+index 0000000..060ebd9
+--- /dev/null
++++ b/src/main/java/com/redhat/devtools/lsp4ij/dap/actions/DAPReverseExecutionSupport.java
+@@ -0,0 +1,37 @@
++/*******************************************************************************
++ * Copyright (c) 2026 Red Hat, Inc.
++ * Distributed under license by Red Hat, Inc. All rights reserved.
++ * This program is made available under the terms of the
++ * Eclipse Public License v2.0 which accompanies this distribution,
++ * and is available at http://www.eclipse.org/legal/epl-v20.html
++ *
++ * Contributors:
++ * Red Hat, Inc. - initial API and implementation
++ ******************************************************************************/
++package com.redhat.devtools.lsp4ij.dap.actions;
++
++import org.eclipse.lsp4j.debug.Capabilities;
++import org.jetbrains.annotations.Nullable;
++
++/**
++ * Decides whether the reverse-execution debugger actions ("Reverse Continue" / "Step Back")
++ * apply to a session, based purely on the debug adapter's advertised capabilities.
++ * <p>
++ * Kept as a tiny pure helper so the gating rule can be unit tested without a live session.
++ */
++public final class DAPReverseExecutionSupport {
++
++    private DAPReverseExecutionSupport() {
++    }
++
++    /**
++     * Returns {@code true} when the adapter advertised the DAP {@code supportsStepBack}
++     * capability, i.e. it accepts the {@code reverseContinue} / {@code stepBack} requests.
++     *
++     * @param capabilities the capabilities from the adapter's {@code initialize} response,
++     *                     or {@code null} if not received yet.
++     */
++    public static boolean isReverseExecutionAvailable(@Nullable Capabilities capabilities) {
++        return capabilities != null && Boolean.TRUE.equals(capabilities.getSupportsStepBack());
++    }
++}
+diff --git a/src/main/java/com/redhat/devtools/lsp4ij/dap/actions/ReverseContinueAction.java b/src/main/java/com/redhat/devtools/lsp4ij/dap/actions/ReverseContinueAction.java
+new file mode 100644
+index 0000000..f780bbb
+--- /dev/null
++++ b/src/main/java/com/redhat/devtools/lsp4ij/dap/actions/ReverseContinueAction.java
+@@ -0,0 +1,37 @@
++/*******************************************************************************
++ * Copyright (c) 2026 Red Hat, Inc.
++ * Distributed under license by Red Hat, Inc. All rights reserved.
++ * This program is made available under the terms of the
++ * Eclipse Public License v2.0 which accompanies this distribution,
++ * and is available at http://www.eclipse.org/legal/epl-v20.html
++ *
++ * Contributors:
++ * Red Hat, Inc. - initial API and implementation
++ ******************************************************************************/
++package com.redhat.devtools.lsp4ij.dap.actions;
++
++import com.intellij.xdebugger.frame.XSuspendContext;
++import com.redhat.devtools.lsp4ij.dap.DAPBundle;
++import com.redhat.devtools.lsp4ij.dap.DAPDebugProcess;
++import org.jetbrains.annotations.NotNull;
++import org.jetbrains.annotations.Nullable;
++
++/**
++ * "Reverse Continue" debugger action: resumes backward execution until an earlier
++ * breakpoint is hit or the start of the recorded history is reached (DAP
++ * {@code reverseContinue}). Only shown for adapters that advertise
++ * {@code supportsStepBack} (e.g. an rr-backed {@code lldb-dap}).
++ */
++public class ReverseContinueAction extends DAPReverseActionBase {
++
++    public ReverseContinueAction() {
++        super(DAPBundle.messagePointer("dap.action.reverseContinue.text"),
++                DAPBundle.messagePointer("dap.action.reverseContinue.description"),
++                DAPDebuggerIcons.ReverseContinue);
++    }
++
++    @Override
++    protected void perform(@NotNull DAPDebugProcess process, @Nullable XSuspendContext context) {
++        process.reverseResume(context);
++    }
++}
+diff --git a/src/main/java/com/redhat/devtools/lsp4ij/dap/actions/StepBackAction.java b/src/main/java/com/redhat/devtools/lsp4ij/dap/actions/StepBackAction.java
+new file mode 100644
+index 0000000..64e65dd
+--- /dev/null
++++ b/src/main/java/com/redhat/devtools/lsp4ij/dap/actions/StepBackAction.java
+@@ -0,0 +1,37 @@
++/*******************************************************************************
++ * Copyright (c) 2026 Red Hat, Inc.
++ * Distributed under license by Red Hat, Inc. All rights reserved.
++ * This program is made available under the terms of the
++ * Eclipse Public License v2.0 which accompanies this distribution,
++ * and is available at http://www.eclipse.org/legal/epl-v20.html
++ *
++ * Contributors:
++ * Red Hat, Inc. - initial API and implementation
++ ******************************************************************************/
++package com.redhat.devtools.lsp4ij.dap.actions;
++
++import com.intellij.xdebugger.frame.XSuspendContext;
++import com.redhat.devtools.lsp4ij.dap.DAPBundle;
++import com.redhat.devtools.lsp4ij.dap.DAPDebugProcess;
++import org.jetbrains.annotations.NotNull;
++import org.jetbrains.annotations.Nullable;
++
++/**
++ * "Step Back" debugger action: single steps the current thread backwards (DAP
++ * {@code stepBack}). Only shown for adapters that advertise {@code supportsStepBack};
++ * adapters without a real reverse-step implementation answer with a DAP error, which is
++ * surfaced in the debug console.
++ */
++public class StepBackAction extends DAPReverseActionBase {
++
++    public StepBackAction() {
++        super(DAPBundle.messagePointer("dap.action.stepBack.text"),
++                DAPBundle.messagePointer("dap.action.stepBack.description"),
++                DAPDebuggerIcons.StepBack);
++    }
++
++    @Override
++    protected void perform(@NotNull DAPDebugProcess process, @Nullable XSuspendContext context) {
++        process.startStepBack(context);
++    }
++}
+diff --git a/src/main/java/com/redhat/devtools/lsp4ij/dap/client/DAPClient.java b/src/main/java/com/redhat/devtools/lsp4ij/dap/client/DAPClient.java
+index 2603e12..ed491e7 100644
+--- a/src/main/java/com/redhat/devtools/lsp4ij/dap/client/DAPClient.java
++++ b/src/main/java/com/redhat/devtools/lsp4ij/dap/client/DAPClient.java
+@@ -585,6 +585,41 @@ public class DAPClient implements IDebugProtocolClient, Disposable {
+         return debugProtocolServer.stepInTargets(args);
+     }
+ 
++    /**
++     * Sends a DAP 'reverseContinue' request to resume backward execution of the given thread.
++     * Only meaningful when the debug adapter is backed by a record/replay engine (e.g. rr);
++     * against any other target the returned future completes exceptionally with the adapter's
++     * error message.
++     *
++     * @param threadId the thread to resume backwards.
++     * @return a future completed when the adapter acknowledges the request.
++     */
++    public CompletableFuture<Void> reverseContinue(int threadId) {
++        if (debugProtocolServer == null) {
++            return CompletableFuture.completedFuture(null);
++        }
++        ReverseContinueArguments args = new ReverseContinueArguments();
++        args.setThreadId(threadId);
++        return debugProtocolServer.reverseContinue(args);
++    }
++
++    /**
++     * Sends a DAP 'stepBack' request (single step backwards) for the given thread.
++     *
++     * @param threadId    the thread to step backwards.
++     * @param granularity the stepping granularity, or {@code null} for the adapter default.
++     * @return a future completed when the adapter acknowledges the request.
++     */
++    public CompletableFuture<Void> stepBack(int threadId, @Nullable SteppingGranularity granularity) {
++        if (debugProtocolServer == null) {
++            return CompletableFuture.completedFuture(null);
++        }
++        StepBackArguments args = new StepBackArguments();
++        args.setThreadId(threadId);
++        args.setGranularity(granularity);
++        return debugProtocolServer.stepBack(args);
++    }
++
+     public CompletableFuture<EvaluateResponse> evaluate(@NotNull String expression,
+                                                         @Nullable Integer frameId,
+                                                         @NotNull String context) {
+@@ -706,6 +741,17 @@ public class DAPClient implements IDebugProtocolClient, Disposable {
+         return Boolean.TRUE.equals(getCapabilities().getSupportsDisassembleRequest());
+     }
+ 
++    /**
++     * Returns true if the debug adapter supports reverse execution, i.e. the 'stepBack' and
++     * 'reverseContinue' requests (DAP 'supportsStepBack' capability), and false otherwise.
++     *
++     * @return true if the debug adapter advertised the 'supportsStepBack' capability.
++     */
++    public boolean isSupportsStepBack() {
++        return com.redhat.devtools.lsp4ij.dap.actions.DAPReverseExecutionSupport
++                .isReverseExecutionAvailable(getCapabilities());
++    }
++
+     @NotNull
+     public DebugAdapterDescriptor getServerDescriptor() {
+         return debugProcess.getServerDescriptor();
+diff --git a/src/main/resources/icons/dap/reverseContinue.svg b/src/main/resources/icons/dap/reverseContinue.svg
+new file mode 100644
+index 0000000..b895923
+--- /dev/null
++++ b/src/main/resources/icons/dap/reverseContinue.svg
+@@ -0,0 +1,3 @@
++<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
++  <path d="M11 3.2c0-.4-.46-.63-.79-.4L3.4 7.6a.5.5 0 0 0 0 .8l6.81 4.8c.33.23.79 0 .79-.4V3.2Z" fill="#59A869"/>
++</svg>
+diff --git a/src/main/resources/icons/dap/stepBack.svg b/src/main/resources/icons/dap/stepBack.svg
+new file mode 100644
+index 0000000..fc996a4
+--- /dev/null
++++ b/src/main/resources/icons/dap/stepBack.svg
+@@ -0,0 +1,4 @@
++<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
++  <rect x="2.5" y="3" width="1.8" height="10" rx="0.4" fill="#389FD6"/>
++  <path d="M13 3.6c0-.4-.46-.63-.79-.4L6.2 7.6a.5.5 0 0 0 0 .8l6.01 4.4c.33.24.79 0 .79-.4V3.6Z" fill="#389FD6"/>
++</svg>
+diff --git a/src/main/resources/messages/DAPBundle.properties b/src/main/resources/messages/DAPBundle.properties
+index 8e81527..2a081b6 100644
+--- a/src/main/resources/messages/DAPBundle.properties
++++ b/src/main/resources/messages/DAPBundle.properties
+@@ -70,3 +70,9 @@ dap.breakpoints.title=DAP Breakpoint
+ 
+ # Disassembly
+ dap.disassembly.breakpoints.title=DAP Disassembly Breakpoint
++
++# Reverse execution actions
++dap.action.reverseContinue.text=Reverse Continue
++dap.action.reverseContinue.description=Resume backward execution until an earlier breakpoint or the start of the recorded history
++dap.action.stepBack.text=Step Back
++dap.action.stepBack.description=Step a single statement backward
+diff --git a/src/test/java/com/redhat/devtools/lsp4ij/dap/actions/DAPReverseExecutionSupportTest.java b/src/test/java/com/redhat/devtools/lsp4ij/dap/actions/DAPReverseExecutionSupportTest.java
+new file mode 100644
+index 0000000..7e5b726
+--- /dev/null
++++ b/src/test/java/com/redhat/devtools/lsp4ij/dap/actions/DAPReverseExecutionSupportTest.java
+@@ -0,0 +1,48 @@
++/*******************************************************************************
++ * Copyright (c) 2026 Red Hat, Inc.
++ * Distributed under license by Red Hat, Inc. All rights reserved.
++ * This program is made available under the terms of the
++ * Eclipse Public License v2.0 which accompanies this distribution,
++ * and is available at http://www.eclipse.org/legal/epl-v20.html
++ *
++ * Contributors:
++ * Red Hat, Inc. - initial API and implementation
++ ******************************************************************************/
++package com.redhat.devtools.lsp4ij.dap.actions;
++
++import org.eclipse.lsp4j.debug.Capabilities;
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * Unit tests for {@link DAPReverseExecutionSupport}, the gating rule for the
++ * "Reverse Continue" / "Step Back" debugger actions.
++ */
++class DAPReverseExecutionSupportTest {
++
++    @Test
++    void notAvailable_whenCapabilitiesMissing() {
++        assertFalse(DAPReverseExecutionSupport.isReverseExecutionAvailable(null));
++    }
++
++    @Test
++    void notAvailable_whenFlagUnset() {
++        assertFalse(DAPReverseExecutionSupport.isReverseExecutionAvailable(new Capabilities()));
++    }
++
++    @Test
++    void notAvailable_whenFlagFalse() {
++        Capabilities capabilities = new Capabilities();
++        capabilities.setSupportsStepBack(false);
++        assertFalse(DAPReverseExecutionSupport.isReverseExecutionAvailable(capabilities));
++    }
++
++    @Test
++    void available_whenFlagTrue() {
++        Capabilities capabilities = new Capabilities();
++        capabilities.setSupportsStepBack(true);
++        assertTrue(DAPReverseExecutionSupport.isReverseExecutionAvailable(capabilities));
++    }
++}

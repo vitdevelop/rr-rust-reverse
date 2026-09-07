@@ -1,0 +1,18 @@
+# large upstream checkout used only for variant A (build lldb-dap from source)
+/src/llvm-project/
+
+# build outputs
+/build/
+/install/
+
+# python
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+*.iml
+
+# e2e script outputs
+/E2E-RESULTS.md
+/E2E-STOCK-RESULTS.md

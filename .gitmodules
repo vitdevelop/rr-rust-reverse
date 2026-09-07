@@ -1,0 +1,4 @@
+[submodule "src/lsp4ij"]
+	path = src/lsp4ij
+	url = git@github.com:vitdevelop/lsp4ij.git
+	branch = main
